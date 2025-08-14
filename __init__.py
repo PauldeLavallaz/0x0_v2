@@ -1,3 +1,4 @@
+
 import os, io, re, base64, wave, requests
 
 try:
@@ -10,18 +11,88 @@ try:
 except Exception:
     np = None
 
+# =========================
+# Upload helpers (with fallback)
+# =========================
 
-# ----------------- helpers -----------------
-
-AUDIO_EXTS = (".mp3", ".wav", ".m4a", ".ogg", ".flac", ".aac", ".opus", ".webm")
-
-def _upload_bytes(filename: str, data: bytes) -> str:
-    r = requests.post("https://0x0.st", files={"file": (filename, data)}, timeout=60)
+def _upload_0x0(filename: str, data: bytes) -> str:
+    r = requests.post("https://0x0.st", files={"file": (filename, data)}, timeout=60, headers={"User-Agent":"curl/8.0"})
     r.raise_for_status()
     url = r.text.strip()
     if not (url.startswith("http://") or url.startswith("https://")):
         raise RuntimeError(f"0x0.st bad response: {url[:120]}")
     return url
+
+def _upload_transfer_sh(filename: str, data: bytes) -> str:
+    r = requests.put(f"https://transfer.sh/{filename}", data=data, timeout=120, headers={"User-Agent":"curl/8.0"})
+    r.raise_for_status()
+    url = r.text.strip().split()[0]
+    if not (url.startswith("http://") or url.startswith("https://")):
+        raise RuntimeError(f"transfer.sh bad response: {url[:120]}")
+    return url
+
+def _upload_tmpfiles(filename: str, data: bytes) -> str:
+    r = requests.post("https://tmpfiles.org/api/v1/upload", files={"file": (filename, data)}, timeout=120)
+    r.raise_for_status()
+    j = r.json()
+    url = j.get("data",{}).get("url","").replace("tmpfiles.org/","tmpfiles.org/dl/")
+    if not (url.startswith("http://") or url.startswith("https://")):
+        raise RuntimeError(f"tmpfiles bad response: {j}")
+    return url
+
+def _upload_bytes(filename: str, data: bytes, uploader: str = "auto") -> str:
+    order = {
+        "auto":       (_upload_0x0, _upload_transfer_sh, _upload_tmpfiles),
+        "0x0":        (_upload_0x0,),
+        "transfer.sh":(_upload_transfer_sh,),
+        "tmpfiles":   (_upload_tmpfiles,),
+    }.get(uploader, (_upload_transfer_sh,))
+    last = None
+    for fn in order:
+        try:
+            return fn(filename, data)
+        except Exception as e:
+            last = e
+            continue
+    raise last if last else RuntimeError("upload failed")
+
+# =========================
+# Common utilities
+# =========================
+
+def _is_url(s: str) -> bool:
+    return isinstance(s, str) and (s.startswith("http://") or s.startswith("https://") or s.startswith("s3://"))
+
+def _is_data_uri(s: str) -> bool:
+    return isinstance(s, str) and s.startswith("data:")
+
+def _img_to_bytes(image, fmt="png", quality=95) -> bytes:
+    from PIL import Image as PILImage
+    if torch is not None and isinstance(image, torch.Tensor):
+        t = image
+        if t.ndim == 4:
+            # B,C,H,W or B,H,W,C -> HWC
+            if t.shape[1] in (1,3) and t.shape[-1] not in (1,3):
+                t = t.permute(0,2,3,1)
+            t = t[0]
+        if t.ndim != 3:
+            raise RuntimeError("Unexpected IMAGE tensor shape")
+        arr = t.detach().cpu().clamp(0,1).mul(255).round().byte().numpy()
+    else:
+        raise RuntimeError("Unsupported IMAGE type")
+    mode = "RGBA" if arr.shape[-1] == 4 else "RGB"
+    pil = PILImage.fromarray(arr, mode=mode)
+    bio = io.BytesIO()
+    if fmt == "jpeg":
+        pil = pil.convert("RGB")
+        pil.save(bio, format="JPEG", quality=int(quality))
+    elif fmt == "png":
+        pil.save(bio, format="PNG")
+    elif fmt == "webp":
+        pil.save(bio, format="WEBP", quality=int(quality))
+    else:
+        raise RuntimeError(f"Unsupported image format: {fmt}")
+    return bio.getvalue()
 
 def _to_numpy(x):
     if torch is not None and isinstance(x, torch.Tensor):
@@ -31,6 +102,7 @@ def _to_numpy(x):
     raise RuntimeError("Unsupported audio sample array type")
 
 def _samples_to_wav(samples, sr: int) -> bytes:
+    import numpy as _np
     arr = _to_numpy(samples)
     if arr.ndim == 1:
         arr = arr[:, None]          # [T] -> [T,1]
@@ -49,204 +121,210 @@ def _samples_to_wav(samples, sr: int) -> bytes:
         wf.writeframes(arr.tobytes(order="C"))
     return bio.getvalue()
 
-def _is_url(s: str) -> bool:
-    return isinstance(s, str) and (s.startswith("http://") or s.startswith("https://") or s.startswith("s3://"))
+# =========================
+# Nodes
+# =========================
 
-def _is_data_uri(s: str) -> bool:
-    return isinstance(s, str) and s.startswith("data:audio")
-
-def _first_url_in_dict(d: dict) -> str | None:
-    for k in ("url", "audio_url", "href", "link", "src"):
-        v = d.get(k)
-        if _is_url(v):
-            return v
-    for v in d.values():
-        if isinstance(v, str) and _is_url(v):
-            return v
-    return None
-
-def _first_path_in_dict(d: dict) -> str | None:
-    for k in ("path", "filepath", "file", "tmp_path", "audio_path", "local_path", "audio_file", "filename"):
-        v = d.get(k)
-        if isinstance(v, str) and os.path.isfile(v):
-            return v
-    return None
-
-def _first_bytes_in_dict(d: dict) -> bytes | None:
-    for k in ("bytes", "data", "content"):
-        v = d.get(k)
-        if isinstance(v, (bytes, bytearray, io.BytesIO)):
-            return v if isinstance(v, (bytes, bytearray)) else v.getvalue()
-        if isinstance(v, str) and _is_data_uri(v):
-            m = re.match(r"data:(audio/[A-Za-z0-9.+-]+);base64,(.*)$", v, re.IGNORECASE | re.DOTALL)
-            if m:
-                try:
-                    return base64.b64decode(m.group(2))
-                except Exception:
-                    pass
-    return None
-
-def _get_attr(o, names):
-    for n in names:
-        if hasattr(o, n):
-            v = getattr(o, n)
-            if v is not None:
-                return v
-    return None
-
-def _upload_wav_from(samples, sr, filename):
-    wav = _samples_to_wav(samples, int(sr or 44100))
-    fn = (filename or "audio.wav").strip()
-    if not fn.lower().endswith(".wav"):
-        fn = f"{fn}.wav"
-    return _upload_bytes(fn, wav)
-
-
-# ----------------- node -----------------
-
-class AudioToURL_0x0:
+class ImageToURL_0x0:
+    """
+    IMAGE -> URL
+    Encodes a tensor IMAGE (png/jpeg/webp) y sube por el host elegido.
+    """
     @classmethod
     def INPUT_TYPES(cls):
+        # STABLE schema (no cambios de nombres)
         return {
             "required": {
-                "audio": ("AUDIO",),   # admite objetos de Deploy, dicts, str, (samples,sr)
-                "filename": ("STRING", {"default": "audio.wav"}),
-                "force_upload": ("BOOLEAN", {"default": False}),
-                "debug": ("BOOLEAN", {"default": False}),
+                "image": ("IMAGE",),
+                "image_format": (["png","jpeg","webp"], {"default": "png"}),
+                "jpeg_quality": ("INT", {"default": 95, "min": 1, "max": 100}),
+                "filename_hint": ("STRING", {"default": "image.png"}),
+                "uploader": (["auto","0x0","transfer.sh","tmpfiles"], {"default": "auto"}),
             }
         }
-
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("url",)
     FUNCTION = "run"
     CATEGORY = "I/O → URL"
 
-    def run(self, audio, filename="audio.wav", force_upload=False, debug=False):
-        if audio is None:
-            raise RuntimeError("AudioToURL_0x0: no audio provided")
+    def run(self, image, image_format="png", jpeg_quality=95, filename_hint="image.png", uploader="auto"):
+        data = _img_to_bytes(image, fmt=image_format, quality=jpeg_quality)
+        ext = {"png":"png","jpeg":"jpg","webp":"webp"}[image_format]
+        fn = filename_hint.strip() or f"image.{ext}"
+        if not fn.lower().endswith(f".{ext}"):
+            fn = f"{fn}.{ext}"
+        url = _upload_bytes(fn, data, uploader=uploader)
+        return (url,)
 
-        # ---------- 0) Unwrap contenedores comunes ----------
-        # Muchos wrappers (incl. Deploy) guardan el verdadero payload en .audio/.value/etc.
-        for attr in ("audio", "value", "payload", "data"):
-            if hasattr(audio, attr):
-                inner = getattr(audio, attr)
-                if inner is not None:
-                    audio = inner
-                    break
+class AudioToURL_0x0:
+    """
+    AUDIO -> URL
+    - Si trae URL http/https/s3 (como STRING dentro del AUDIO), hace passthrough cuando force_upload=False.
+    - Si trae samples+sample_rate, convierte a WAV y sube.
+    - Acepta dict/tuple/obj/ruta local/bytes/data:audio base64.
+    """
+    @classmethod
+    def INPUT_TYPES(cls):
+        # STABLE schema (no cambios de nombres)
+        return {
+            "required": {
+                "audio": ("AUDIO",),
+                "filename": ("STRING", {"default": "audio.wav"}),
+                "force_upload": ("BOOLEAN", {"default": False}),
+                "uploader": (["auto","0x0","transfer.sh","tmpfiles"], {"default": "auto"}),
+                "debug": ("BOOLEAN", {"default": False}),
+            }
+        }
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("url",)
+    FUNCTION = "run"
+    CATEGORY = "I/O → URL"
 
-        # ---------- 1) STRING ----------
+    # --- internals ---
+    def _first_url_in_dict(self, d: dict):
+        for k in ("url","audio_url","href","link","src"):
+            v = d.get(k)
+            if isinstance(v,str) and (v.startswith("http://") or v.startswith("https://") or v.startswith("s3://")):
+                return v
+        for v in d.values():
+            if isinstance(v,str) and (v.startswith("http://") or v.startswith("https://") or v.startswith("s3://")):
+                return v
+        return None
+
+    def _first_path_in_dict(self, d: dict):
+        for k in ("path","filepath","file","tmp_path","audio_path","local_path","audio_file","filename"):
+            v = d.get(k)
+            if isinstance(v,str) and os.path.isfile(v):
+                return v
+        return None
+
+    def _first_bytes_in_dict(self, d: dict):
+        for k in ("bytes","data","content"):
+            v = d.get(k)
+            if isinstance(v,(bytes,bytearray,io.BytesIO)):
+                return v if isinstance(v,(bytes,bytearray)) else v.getvalue()
+            if isinstance(v,str) and v.startswith("data:audio"):
+                m = re.match(r"data:(audio/[A-Za-z0-9.+-]+);base64,(.*)$", v, re.IGNORECASE | re.DOTALL)
+                if m:
+                    try:
+                        return base64.b64decode(m.group(2))
+                    except Exception:
+                        pass
+        return None
+
+    def run(self, audio, filename="audio.wav", force_upload=False, uploader="auto", debug=False):
+        # Some toolchains hand a STRING as AUDIO
         if isinstance(audio, str):
-            if debug: print("[AudioToURL_0x0] got STRING:", audio[:120])
-            # URL directa
-            if _is_url(audio) and not force_upload:
+            if debug: print("[AudioToURL_0x0] STRING:", audio[:120])
+            if (audio.startswith("http://") or audio.startswith("https://") or audio.startswith("s3://")) and not force_upload:
                 return (audio,)
-            # Path local
             if os.path.isfile(audio):
-                with open(audio, "rb") as f:
-                    return (_upload_bytes(os.path.basename(audio), f.read()),)
-            # Data URI
-            if _is_data_uri(audio):
+                with open(audio,"rb") as f: data=f.read()
+                return (_upload_bytes(os.path.basename(audio), data, uploader=uploader),)
+            if audio.startswith("data:audio"):
                 m = re.match(r"data:(audio/[A-Za-z0-9.+-]+);base64,(.*)$", audio, re.IGNORECASE | re.DOTALL)
                 if m:
-                    ext = m.group(1).split("/")[-1].lower()
-                    bb  = base64.b64decode(m.group(2))
-                    fn  = (filename or f"audio.{ext}").strip()
-                    if not fn.lower().endswith(f".{ext}"):
-                        fn = f"{fn}.{ext}"
-                    return (_upload_bytes(fn, bb),)
+                    ext = m.group(1).split("/")[-1]
+                    bb = base64.b64decode(m.group(2))
+                    fn = filename.strip() or f"audio.{ext}"
+                    if not fn.lower().endswith(f".{ext}"): fn = f"{fn}.{ext}"
+                    return (_upload_bytes(fn, bb, uploader=uploader),)
             raise RuntimeError("AudioToURL_0x0: STRING provided but not URL/path/data URI")
 
-        # ---------- 2) DICT-LIKE (incl. Deploy que emite dict) ----------
-        if hasattr(audio, "get"):  # mapping
+        # dict-like
+        if hasattr(audio, "get"):
             d = audio
             if debug: print("[AudioToURL_0x0] dict keys:", list(d.keys()))
-            u = _first_url_in_dict(d)
+            u = self._first_url_in_dict(d)
             if u and not force_upload:
                 return (u,)
-            p = _first_path_in_dict(d)
+            p = self._first_path_in_dict(d)
             if p:
-                with open(p, "rb") as f:
-                    return (_upload_bytes(os.path.basename(p), f.read()),)
-            b = _first_bytes_in_dict(d)
+                with open(p,"rb") as f: data=f.read()
+                return (_upload_bytes(os.path.basename(p), data, uploader=uploader),)
+            b = self._first_bytes_in_dict(d)
             if b:
-                fn = (filename or "audio.bin").strip()
-                return (_upload_bytes(fn, b),)
-            # (samples, sr) embebido en dict
+                fn = filename.strip() or "audio.bin"
+                return (_upload_bytes(fn, b, uploader=uploader),)
+            # samples + sr
             samples = None
-            for sk in ("samples", "waveform", "audio", "array", "tensor"):
-                if sk in d:
-                    samples = d[sk]; break
+            for sk in ("samples","waveform","audio","array","tensor"):
+                if sk in d: samples = d[sk]; break
             sr = None
-            for rk in ("sample_rate", "sr", "rate", "sampleRate"):
-                if rk in d:
-                    sr = d[rk]; break
+            for rk in ("sample_rate","sr","rate","sampleRate"):
+                if rk in d: sr = d[rk]; break
             if samples is not None:
-                return (_upload_wav_from(samples, sr, filename),)
+                wav = _samples_to_wav(samples, int(sr or 44100))
+                fn = filename.strip() or "audio.wav"
+                if not fn.lower().endswith(".wav"): fn = f"{fn}.wav"
+                return (_upload_bytes(fn, wav, uploader=uploader),)
 
-        # ---------- 2.5) OBJETO con atributos (Deploy wrapper) ----------
-        # Acepta atributos típicos: url / path / bytes / file-like / data URI / samples+sr
-        if not hasattr(audio, "get"):
-            # URL en atributo
-            u = _get_attr(audio, ("url", "audio_url", "href", "link", "src"))
-            if isinstance(u, str) and _is_url(u) and not force_upload:
-                if debug: print("[AudioToURL_0x0] attr URL:", u)
-                return (u,)
-
-            # Path en atributo
-            p = _get_attr(audio, ("path", "filepath", "file", "tmp_path", "audio_path", "local_path", "audio_file", "filename"))
-            if isinstance(p, str) and os.path.isfile(p):
-                if debug: print("[AudioToURL_0x0] attr PATH:", p)
-                with open(p, "rb") as f:
-                    return (_upload_bytes(os.path.basename(p), f.read()),)
-
-            # File-like (stream)
-            fobj = _get_attr(audio, ("fileobj", "fp", "stream"))
-            if fobj and hasattr(fobj, "read"):
-                bb = fobj.read()
-                if isinstance(bb, (bytes, bytearray)):
-                    if debug: print("[AudioToURL_0x0] attr FILEOBJ bytes")
-                    fn = (filename or "audio.bin").strip()
-                    return (_upload_bytes(fn, bb if isinstance(bb, (bytes, bytearray)) else bytes(bb)),)
-
-            # Bytes en atributo o Data URI
-            bb = _get_attr(audio, ("bytes", "data", "content"))
-            if isinstance(bb, io.BytesIO):
-                bb = bb.getvalue()
-            if isinstance(bb, (bytes, bytearray)):
-                if debug: print("[AudioToURL_0x0] attr BYTES")
-                fn = (filename or "audio.bin").strip()
-                return (_upload_bytes(fn, bb),)
-            durl = _get_attr(audio, ("data_url", "datauri"))
-            if isinstance(durl, str) and _is_data_uri(durl):
-                m = re.match(r"data:(audio/[A-Za-z0-9.+-]+);base64,(.*)$", durl, re.IGNORECASE | re.DOTALL)
-                if m:
-                    ext = m.group(1).split("/")[-1].lower()
-                    bb  = base64.b64decode(m.group(2))
-                    fn  = (filename or f"audio.{ext}").strip()
-                    if not fn.lower().endswith(f".{ext}"):
-                        fn = f"{fn}.{ext}"
-                    return (_upload_bytes(fn, bb),)
-
-            # (samples, sr) por atributos
-            samples = _get_attr(audio, ("samples", "waveform", "array", "tensor"))
-            sr      = _get_attr(audio, ("sample_rate", "sr", "rate", "sampleRate"))
-            if samples is not None:
-                if debug: print("[AudioToURL_0x0] attr SAMPLES+SR")
-                return (_upload_wav_from(samples, sr, filename),)
-
-        # ---------- 3) tuple/list (samples, sr) ----------
-        if isinstance(audio, (tuple, list)) and len(audio) == 2:
+        # tuple/list (samples, sr)
+        if isinstance(audio, (tuple,list)) and len(audio) == 2:
             samples, sr = audio
-            if debug: print("[AudioToURL_0x0] tuple/list SAMPLES+SR")
-            return (_upload_wav_from(samples, sr, filename),)
+            wav = _samples_to_wav(samples, int(sr or 44100))
+            fn = filename.strip() or "audio.wav"
+            if not fn.lower().endswith(".wav"): fn = f"{fn}.wav"
+            return (_upload_bytes(fn, wav, uploader=uploader),)
 
-        # ---------- 4) objeto con .samples/.sample_rate ----------
+        # object with attrs
         if hasattr(audio, "samples") and hasattr(audio, "sample_rate"):
-            if debug: print("[AudioToURL_0x0] object SAMPLES+SR attrs")
-            return (_upload_wav_from(getattr(audio, "samples"), int(getattr(audio, "sample_rate") or 44100), filename),)
+            wav = _samples_to_wav(getattr(audio,"samples"), int(getattr(audio,"sample_rate") or 44100))
+            fn = filename.strip() or "audio.wav"
+            if not fn.lower().endswith(".wav"): fn = f"{fn}.wav"
+            return (_upload_bytes(fn, wav, uploader=uploader),)
 
         raise RuntimeError("AudioToURL_0x0: unsupported AUDIO payload")
 
+class PathToURL_0x0:
+    """
+    STRING path or URL -> URL
+    - Si ya es URL http/https/s3 y force_upload=False, passthrough.
+    - Soporta data:URI y ruta local.
+    """
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "path": ("STRING", {"default": ""}),
+                "filename_hint": ("STRING", {"default": "file.bin"}),
+                "force_upload": ("BOOLEAN", {"default": False}),
+                "uploader": (["auto","0x0","transfer.sh","tmpfiles"], {"default": "auto"}),
+            }
+        }
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("url",)
+    FUNCTION = "run"
+    CATEGORY = "I/O → URL"
 
-NODE_CLASS_MAPPINGS = {"AudioToURL_0x0": AudioToURL_0x0}
-NODE_DISPLAY_NAME_MAPPINGS = {"AudioToURL_0x0": "Audio → URL (0x0.st)"}
+    def run(self, path, filename_hint="file.bin", force_upload=False, uploader="auto"):
+        if not isinstance(path, str) or not path:
+            raise RuntimeError("PathToURL_0x0 expects STRING")
+        if not force_upload and (path.startswith("http://") or path.startswith("https://") or path.startswith("s3://")):
+            return (path,)
+        if path.startswith("data:"):
+            m = re.match(r"data:([^;]+);base64,(.*)$", path, re.IGNORECASE | re.DOTALL)
+            if not m: raise RuntimeError("Unsupported data URI")
+            mime, b64 = m.groups()
+            data = base64.b64decode(b64)
+            ext = mime.split("/")[-1]
+            fn = filename_hint.strip() or f"file.{ext}"
+            if not fn.lower().endswith(f".{ext}"):
+                fn = f"{fn}.{ext}"
+            return (_upload_bytes(fn, data, uploader=uploader),)
+        if os.path.isfile(path):
+            with open(path,"rb") as f: data=f.read()
+            fn = filename_hint.strip() or os.path.basename(path)
+            return (_upload_bytes(fn, data, uploader=uploader),)
+        raise RuntimeError("Invalid path for PathToURL_0x0")
+
+NODE_CLASS_MAPPINGS = {
+    "ImageToURL_0x0": ImageToURL_0x0,
+    "AudioToURL_0x0": AudioToURL_0x0,
+    "PathToURL_0x0": PathToURL_0x0,
+}
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "ImageToURL_0x0": "Image → URL (0x0.st)",
+    "AudioToURL_0x0": "Audio → URL (0x0.st)",
+    "PathToURL_0x0": "Path → URL (0x0.st)",
+}
