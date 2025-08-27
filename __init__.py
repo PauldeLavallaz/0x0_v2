@@ -3,7 +3,7 @@ import os, io, re, base64, wave, requests, ast
 try:
     import torch
 except Exception:
-        torch = None
+    torch = None
 
 try:
     import numpy as np
@@ -35,6 +35,15 @@ def _verify_accessible(url: str, timeout: int = 20) -> bool:
         return False
     except Exception:
         return False
+
+def _download_bytes(url: str, timeout: int = 300) -> bytes:
+    with requests.get(url, stream=True, allow_redirects=True, timeout=timeout) as r:
+        r.raise_for_status()
+        bio = io.BytesIO()
+        for chunk in r.iter_content(chunk_size=1024 * 1024):
+            if chunk:
+                bio.write(chunk)
+        return bio.getvalue()
 
 
 # ============ uploaders (con fallback) ============
@@ -149,7 +158,7 @@ def _decode_bytes_string(s: str) -> bytes:
       - data URI: data:audio/mpeg;base64,....
       - Base64 “puro”
       - Hex (con o sin 0x)
-      - Texto crudo (se interpreta como latin-1)
+      - Texto crudo (latin-1)
     """
     if not isinstance(s, str):
         raise RuntimeError("Expected STRING with byte content")
@@ -170,10 +179,9 @@ def _decode_bytes_string(s: str) -> bytes:
         if m:
             b64 = m.group(2)
             return base64.b64decode(b64)
-        # data:...;charset=...;... no soportado acá
         raise RuntimeError("Unsupported data URI for bytes string")
 
-    # 3) Base64 “crudo”
+    # 3) Base64 puro
     try:
         return base64.b64decode(s, validate=True)
     except Exception:
@@ -182,14 +190,59 @@ def _decode_bytes_string(s: str) -> bytes:
     # 4) Hex
     hex_s = s[2:] if s.lower().startswith("0x") else s
     try:
-        # quitar espacios
         hex_s_clean = re.sub(r"\s+", "", hex_s)
         return bytes.fromhex(hex_s_clean)
     except Exception:
         pass
 
-    # 5) Fallback: interpretar como texto que representa bytes (latin-1)
+    # 5) Fallback texto→bytes
     return s.encode("latin-1", errors="ignore")
+
+
+# ============ helpers para dict VIDEO (URLs/paths) ============
+
+_URL_KEYS = ("video_url", "url", "href", "link", "src")
+_PATH_KEYS = ("path", "video_path", "local_path", "tmp_path", "filename", "file")
+
+def _dict_first_url(obj):
+    if isinstance(obj, dict):
+        for k in _URL_KEYS:
+            v = obj.get(k)
+            if isinstance(v, str) and _is_url(v):
+                return v
+        v = obj.get("video")
+        if isinstance(v, (dict, str)):
+            return _dict_first_url(v)
+        for v in obj.values():
+            if isinstance(v, str) and _is_url(v):
+                return v
+            if isinstance(v, dict):
+                out = _dict_first_url(v)
+                if out:
+                    return out
+    elif isinstance(obj, str) and _is_url(obj):
+        return obj
+    return None
+
+def _dict_first_path(obj):
+    if isinstance(obj, dict):
+        for k in _PATH_KEYS:
+            v = obj.get(k)
+            if isinstance(v, str) and os.path.isfile(v):
+                return v
+        v = obj.get("video")
+        if isinstance(v, (dict, str)):
+            return _dict_first_path(v)
+        for v in obj.values():
+            if isinstance(v, str) and os.path.isfile(v):
+                return v
+            if isinstance(v, dict):
+                out = _dict_first_path(v)
+                if out:
+                    return out
+    elif isinstance(obj, str) and os.path.isfile(obj):
+        return obj
+    return None
 
 
 # ============ nodos ============
@@ -238,9 +291,108 @@ class AudioToURL_0x0:
     FUNCTION = "run"
     CATEGORY = "I/O → URL"
 
-    # Tu lógica original va aquí. Si no usás este nodo, podés ignorarlo.
+    def _first_url_in_dict(self, d: dict):
+        for k in ("url", "audio_url", "href", "link", "src"):
+            v = d.get(k)
+            if isinstance(v, str) and (v.startswith("http://") or v.startswith("https://") or v.startswith("s3://")):
+                return v
+        for v in d.values():
+            if isinstance(v, str) and (v.startswith("http://") or v.startswith("https://") or v.startswith("s3://")):
+                return v
+        return None
+
+    def _first_path_in_dict(self, d: dict):
+        for k in ("path", "filepath", "file", "tmp_path", "audio_path", "local_path", "audio_file", "filename"):
+            v = d.get(k)
+            if isinstance(v, str) and os.path.isfile(v):
+                return v
+        return None
+
+    def _first_bytes_in_dict(self, d: dict):
+        for k in ("bytes", "data", "content"):
+            v = d.get(k)
+            if isinstance(v, (bytes, bytearray, io.BytesIO)):
+                return v if isinstance(v, (bytes, bytearray)) else v.getvalue()
+            if isinstance(v, str) and v.startswith("data:audio"):
+                m = re.match(r"data:(audio/[A-Za-z0-9.+-]+);base64,(.*)$", v, re.IGNORECASE | re.DOTALL)
+                if m:
+                    try:
+                        return base64.b64decode(m.group(2))
+                    except Exception:
+                        pass
+        return None
+
     def run(self, audio, filename="audio.wav", force_upload=False, uploader="auto", debug=False):
-        raise RuntimeError("AudioToURL_0x0.run no implementado en este archivo.")
+        # STRING como AUDIO
+        if isinstance(audio, str):
+            if debug: print("[AudioToURL_0x0] STRING:", audio[:120])
+            if (audio.startswith("http://") or audio.startswith("https://") or audio.startswith("s3://")) and not force_upload:
+                return (_ensure_https(audio),)
+            if os.path.isfile(audio):
+                with open(audio, "rb") as f:
+                    data = f.read()
+                return (_upload_bytes(os.path.basename(audio), data, uploader=uploader),)
+            if audio.startswith("data:audio"):
+                m = re.match(r"data:(audio/[A-Za-z0-9.+-]+);base64,(.*)$", audio, re.IGNORECASE | re.DOTALL)
+                if m:
+                    ext = m.group(1).split("/")[-1]
+                    bb = base64.b64decode(m.group(2))
+                    fn = filename.strip() or f"audio.{ext}"
+                    if not fn.lower().endswith(f".{ext}"):
+                        fn = f"{fn}.{ext}"
+                    return (_upload_bytes(fn, bb, uploader=uploader),)
+            raise RuntimeError("AudioToURL_0x0: STRING provided but not URL/path/data URI")
+
+        # dict-like
+        if hasattr(audio, "get"):
+            d = audio
+            if debug: print("[AudioToURL_0x0] dict keys:", list(d.keys()))
+            u = self._first_url_in_dict(d)
+            if u and not force_upload:
+                return (_ensure_https(u),)
+            p = self._first_path_in_dict(d)
+            if p:
+                with open(p, "rb") as f:
+                    data = f.read()
+                return (_upload_bytes(os.path.basename(p), data, uploader=uploader),)
+            b = self._first_bytes_in_dict(d)
+            if b:
+                fn = filename.strip() or "audio.bin"
+                return (_upload_bytes(fn, b, uploader=uploader),)
+            # samples + sr
+            samples = None
+            for sk in ("samples", "waveform", "audio", "array", "tensor"):
+                if sk in d:
+                    samples = d[sk]; break
+            sr = None
+            for rk in ("sample_rate", "sr", "rate", "sampleRate"):
+                if rk in d:
+                    sr = d[rk]; break
+            if samples is not None:
+                wav = _samples_to_wav(samples, int(sr or 44100))
+                fn = filename.strip() or "audio.wav"
+                if not fn.lower().endswith(".wav"):
+                    fn = f"{fn}.wav"
+                return (_upload_bytes(fn, wav, uploader=uploader),)
+
+        # tuple/list (samples, sr)
+        if isinstance(audio, (tuple, list)) and len(audio) == 2:
+            samples, sr = audio
+            wav = _samples_to_wav(samples, int(sr or 44100))
+            fn = filename.strip() or "audio.wav"
+            if not fn.lower().endswith(".wav"):
+                fn = f"{fn}.wav"
+            return (_upload_bytes(fn, wav, uploader=uploader),)
+
+        # objeto con attrs
+        if hasattr(audio, "samples") and hasattr(audio, "sample_rate"):
+            wav = _samples_to_wav(getattr(audio, "samples"), int(getattr(audio, "sample_rate") or 44100))
+            fn = filename.strip() or "audio.wav"
+            if not fn.lower().endswith(".wav"):
+                fn = f"{fn}.wav"
+            return (_upload_bytes(fn, wav, uploader=uploader),)
+
+        raise RuntimeError("AudioToURL_0x0: unsupported AUDIO payload")
 
 
 class PathToURL_0x0:
@@ -298,12 +450,25 @@ class VideoToURL_0x0:
     FUNCTION = "run"
     CATEGORY = "I/O → URL"
 
+    def _handle_url(self, url: str, filename_hint: str, uploader: str, force_upload: bool):
+        if not force_upload:
+            return (_ensure_https(url),)
+        data = _download_bytes(url)
+        ext = "mp4"
+        m = re.search(r"\.([A-Za-z0-9]+)(?:\?|$)", url)
+        if m:
+            ext = m.group(1).lower()
+        fn = (filename_hint.strip() or f"video.{ext}")
+        if not fn.lower().endswith(f".{ext}"):
+            fn = f"{fn}.{ext}"
+        return (_upload_bytes(fn, data, uploader=uploader),)
+
     def run(self, video, filename_hint="video.mp4", force_upload=False, uploader="auto"):
-        # caso 1: string
+        # 1) string (url / data uri / path)
         if isinstance(video, str):
             s = video.strip()
-            if not force_upload and _is_url(s):
-                return (_ensure_https(s),)
+            if _is_url(s):
+                return self._handle_url(s, filename_hint, uploader, force_upload)
             if _is_data_uri(s) and s.lower().startswith("data:video"):
                 m = re.match(r"data:(video/[A-Za-z0-9.+-]+);base64,(.*)$", s, re.IGNORECASE | re.DOTALL)
                 if not m:
@@ -322,21 +487,36 @@ class VideoToURL_0x0:
                 return (_upload_bytes(fn, data, uploader=uploader),)
             raise RuntimeError("Invalid string input for VideoToURL_0x0")
 
-        # caso 2: dict con path
+        # 2) dict (Kling suele devolver URL pública o anidada)
         if hasattr(video, "get"):
             d = video
-            if "path" in d and os.path.isfile(d["path"]):
-                with open(d["path"], "rb") as f:
+            u = _dict_first_url(d)
+            if u:
+                return self._handle_url(u, filename_hint, uploader, force_upload)
+            p = _dict_first_path(d)
+            if p:
+                with open(p, "rb") as f:
                     data = f.read()
-                fn = filename_hint.strip() or os.path.basename(d["path"])
+                fn = filename_hint.strip() or os.path.basename(p)
                 return (_upload_bytes(fn, data, uploader=uploader),)
 
-        # caso 3: objeto con atributo video_path
-        if hasattr(video, "video_path") and os.path.isfile(video.video_path):
+        # 3) objeto con atributo video_path
+        if hasattr(video, "video_path") and isinstance(video.video_path, str) and os.path.isfile(video.video_path):
             with open(video.video_path, "rb") as f:
                 data = f.read()
             fn = filename_hint.strip() or os.path.basename(video.video_path)
             return (_upload_bytes(fn, data, uploader=uploader),)
+
+        # 4) lista/tupla [url|path, ...]
+        if isinstance(video, (list, tuple)) and len(video) > 0 and isinstance(video[0], str):
+            s = video[0].strip()
+            if _is_url(s):
+                return self._handle_url(s, filename_hint, uploader, force_upload)
+            if os.path.isfile(s):
+                with open(s, "rb") as f:
+                    data = f.read()
+                fn = filename_hint.strip() or os.path.basename(s)
+                return (_upload_bytes(fn, data, uploader=uploader),)
 
         raise RuntimeError("VideoToURL_0x0: unsupported VIDEO payload")
 
@@ -370,14 +550,11 @@ class ByteStringMP3ToURL_0x0:
 
         s = bytes_string.strip()
 
-        # Si ya es una URL y no forzamos upload, devolvemos tal cual
         if not force_upload and _is_url(s):
             return (_ensure_https(s),)
 
-        # Decodificar a bytes
         data = _decode_bytes_string(s)
 
-        # Asegurar extensión .mp3
         fn = (filename or "audio.mp3").strip()
         if not fn.lower().endswith(".mp3"):
             fn = f"{fn}.mp3"
