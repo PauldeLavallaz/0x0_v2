@@ -1,9 +1,9 @@
-import os, io, re, base64, wave, requests
+import os, io, re, base64, wave, requests, ast
 
 try:
     import torch
 except Exception:
-    torch = None
+        torch = None
 
 try:
     import numpy as np
@@ -142,6 +142,55 @@ def _samples_to_wav(samples, sr: int) -> bytes:
         wf.writeframes(arr.tobytes(order="C"))
     return bio.getvalue()
 
+def _decode_bytes_string(s: str) -> bytes:
+    """
+    Acepta:
+      - Literal de bytes estilo Python:  b'ID3\\x04...'
+      - data URI: data:audio/mpeg;base64,....
+      - Base64 “puro”
+      - Hex (con o sin 0x)
+      - Texto crudo (se interpreta como latin-1)
+    """
+    if not isinstance(s, str):
+        raise RuntimeError("Expected STRING with byte content")
+    s = s.strip()
+
+    # 1) bytes literal estilo Python
+    if (s.startswith("b'") and s.endswith("'")) or (s.startswith('b"') and s.endswith('"')):
+        try:
+            val = ast.literal_eval(s)  # -> bytes
+            if isinstance(val, (bytes, bytearray)):
+                return bytes(val)
+        except Exception:
+            pass
+
+    # 2) data URI
+    if _is_data_uri(s):
+        m = re.match(r"data:([^;]+);base64,(.*)$", s, re.IGNORECASE | re.DOTALL)
+        if m:
+            b64 = m.group(2)
+            return base64.b64decode(b64)
+        # data:...;charset=...;... no soportado acá
+        raise RuntimeError("Unsupported data URI for bytes string")
+
+    # 3) Base64 “crudo”
+    try:
+        return base64.b64decode(s, validate=True)
+    except Exception:
+        pass
+
+    # 4) Hex
+    hex_s = s[2:] if s.lower().startswith("0x") else s
+    try:
+        # quitar espacios
+        hex_s_clean = re.sub(r"\s+", "", hex_s)
+        return bytes.fromhex(hex_s_clean)
+    except Exception:
+        pass
+
+    # 5) Fallback: interpretar como texto que representa bytes (latin-1)
+    return s.encode("latin-1", errors="ignore")
+
 
 # ============ nodos ============
 
@@ -189,7 +238,9 @@ class AudioToURL_0x0:
     FUNCTION = "run"
     CATEGORY = "I/O → URL"
 
-    # (se mantiene tu lógica actual, la podés dejar igual)
+    # Tu lógica original va aquí. Si no usás este nodo, podés ignorarlo.
+    def run(self, audio, filename="audio.wav", force_upload=False, uploader="auto", debug=False):
+        raise RuntimeError("AudioToURL_0x0.run no implementado en este archivo.")
 
 
 class PathToURL_0x0:
@@ -290,6 +341,51 @@ class VideoToURL_0x0:
         raise RuntimeError("VideoToURL_0x0: unsupported VIDEO payload")
 
 
+# ======== NUEVO NODO: ByteString (MP3) → URL ========
+
+class ByteStringMP3ToURL_0x0:
+    """
+    Recibe bytes en formato STRING (por ejemplo:  b'ID3\\x04...') y sube el MP3,
+    devolviendo una URL pública (0x0.st / transfer.sh / tmpfiles).
+    """
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "bytes_string": ("STRING", {"multiline": True, "default": ""}),
+                "filename": ("STRING", {"default": "audio.mp3"}),
+                "uploader": (["auto", "0x0", "transfer.sh", "tmpfiles"], {"default": "auto"}),
+                "force_upload": ("BOOLEAN", {"default": True}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("url",)
+    FUNCTION = "run"
+    CATEGORY = "I/O → URL"
+
+    def run(self, bytes_string, filename="audio.mp3", uploader="auto", force_upload=True):
+        if not isinstance(bytes_string, str) or not bytes_string.strip():
+            raise RuntimeError("ByteStringMP3ToURL_0x0: expected non-empty STRING")
+
+        s = bytes_string.strip()
+
+        # Si ya es una URL y no forzamos upload, devolvemos tal cual
+        if not force_upload and _is_url(s):
+            return (_ensure_https(s),)
+
+        # Decodificar a bytes
+        data = _decode_bytes_string(s)
+
+        # Asegurar extensión .mp3
+        fn = (filename or "audio.mp3").strip()
+        if not fn.lower().endswith(".mp3"):
+            fn = f"{fn}.mp3"
+
+        url = _upload_bytes(fn, data, uploader=uploader)
+        return (_ensure_https(url),)
+
+
 # ============ registros ============
 
 NODE_CLASS_MAPPINGS = {
@@ -297,10 +393,12 @@ NODE_CLASS_MAPPINGS = {
     "AudioToURL_0x0": AudioToURL_0x0,
     "PathToURL_0x0": PathToURL_0x0,
     "VideoToURL_0x0": VideoToURL_0x0,
+    "ByteStringMP3ToURL_0x0": ByteStringMP3ToURL_0x0,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "ImageToURL_0x0": "Image → URL (0x0.st)",
     "AudioToURL_0x0": "Audio → URL (0x0.st)",
     "PathToURL_0x0": "Path → URL (0x0.st)",
     "VideoToURL_0x0": "Video → URL (0x0.st)",
+    "ByteStringMP3ToURL_0x0": "ByteString (MP3) → URL (0x0.st)",
 }
