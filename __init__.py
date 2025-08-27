@@ -189,7 +189,7 @@ class AudioToURL_0x0:
     FUNCTION = "run"
     CATEGORY = "I/O → URL"
 
-    # (contenido igual al tuyo, no lo repito por espacio)
+    # (se mantiene tu lógica actual, la podés dejar igual)
 
 
 class PathToURL_0x0:
@@ -236,7 +236,7 @@ class VideoToURL_0x0:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "video": ("STRING", {"default": ""}),   # URL, ruta local o data URI
+                "video": ("VIDEO",),   # acepta salida de Kling u otros nodos
                 "filename_hint": ("STRING", {"default": "video.mp4"}),
                 "force_upload": ("BOOLEAN", {"default": False}),
                 "uploader": (["auto", "0x0", "transfer.sh", "tmpfiles"], {"default": "auto"}),
@@ -248,34 +248,49 @@ class VideoToURL_0x0:
     CATEGORY = "I/O → URL"
 
     def run(self, video, filename_hint="video.mp4", force_upload=False, uploader="auto"):
-        if not isinstance(video, str) or not video.strip():
-            raise RuntimeError("VideoToURL_0x0 expects STRING with URL/ruta/data URI")
+        # caso 1: string
+        if isinstance(video, str):
+            s = video.strip()
+            if not force_upload and _is_url(s):
+                return (_ensure_https(s),)
+            if _is_data_uri(s) and s.lower().startswith("data:video"):
+                m = re.match(r"data:(video/[A-Za-z0-9.+-]+);base64,(.*)$", s, re.IGNORECASE | re.DOTALL)
+                if not m:
+                    raise RuntimeError("Unsupported video data URI")
+                mime, b64 = m.groups()
+                data = base64.b64decode(b64)
+                ext = mime.split("/")[-1] or "mp4"
+                fn = filename_hint.strip() or f"video.{ext}"
+                if not fn.lower().endswith(f".{ext}"):
+                    fn = f"{fn}.{ext}"
+                return (_upload_bytes(fn, data, uploader=uploader),)
+            if os.path.isfile(s):
+                with open(s, "rb") as f:
+                    data = f.read()
+                fn = filename_hint.strip() or os.path.basename(s)
+                return (_upload_bytes(fn, data, uploader=uploader),)
+            raise RuntimeError("Invalid string input for VideoToURL_0x0")
 
-        s = video.strip()
+        # caso 2: dict con path
+        if hasattr(video, "get"):
+            d = video
+            if "path" in d and os.path.isfile(d["path"]):
+                with open(d["path"], "rb") as f:
+                    data = f.read()
+                fn = filename_hint.strip() or os.path.basename(d["path"])
+                return (_upload_bytes(fn, data, uploader=uploader),)
 
-        if not force_upload and _is_url(s):
-            return (_ensure_https(s),)
-
-        if _is_data_uri(s) and s.lower().startswith("data:video"):
-            m = re.match(r"data:(video/[A-Za-z0-9.+-]+);base64,(.*)$", s, re.IGNORECASE | re.DOTALL)
-            if not m:
-                raise RuntimeError("Unsupported video data URI")
-            mime, b64 = m.groups()
-            data = base64.b64decode(b64)
-            ext = mime.split("/")[-1] or "mp4"
-            fn = filename_hint.strip() or f"video.{ext}"
-            if not fn.lower().endswith(f".{ext}"):
-                fn = f"{fn}.{ext}"
-            return (_upload_bytes(fn, data, uploader=uploader),)
-
-        if os.path.isfile(s):
-            with open(s, "rb") as f:
+        # caso 3: objeto con atributo video_path
+        if hasattr(video, "video_path") and os.path.isfile(video.video_path):
+            with open(video.video_path, "rb") as f:
                 data = f.read()
-            fn = filename_hint.strip() or os.path.basename(s)
+            fn = filename_hint.strip() or os.path.basename(video.video_path)
             return (_upload_bytes(fn, data, uploader=uploader),)
 
-        raise RuntimeError("Invalid input for VideoToURL_0x0: provide URL/ruta local/data URI de video")
+        raise RuntimeError("VideoToURL_0x0: unsupported VIDEO payload")
 
+
+# ============ registros ============
 
 NODE_CLASS_MAPPINGS = {
     "ImageToURL_0x0": ImageToURL_0x0,
