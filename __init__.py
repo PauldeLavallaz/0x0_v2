@@ -1,4 +1,4 @@
-import os, io, re, base64, wave, requests, ast
+import os, io, re, base64, wave, requests
 
 try:
     import torch
@@ -20,6 +20,7 @@ def _ensure_https(url: str) -> str:
 
 def _verify_accessible(url: str, timeout: int = 20) -> bool:
     try:
+        # HEAD primero (algunos devuelven 405); si no, GET de pocos bytes
         h = requests.head(url, allow_redirects=True, timeout=timeout)
         if 200 <= h.status_code < 300:
             return True
@@ -35,15 +36,6 @@ def _verify_accessible(url: str, timeout: int = 20) -> bool:
         return False
     except Exception:
         return False
-
-def _download_bytes(url: str, timeout: int = 300) -> bytes:
-    with requests.get(url, stream=True, allow_redirects=True, timeout=timeout) as r:
-        r.raise_for_status()
-        bio = io.BytesIO()
-        for chunk in r.iter_content(chunk_size=1024 * 1024):
-            if chunk:
-                bio.write(chunk)
-        return bio.getvalue()
 
 
 # ============ uploaders (con fallback) ============
@@ -66,6 +58,7 @@ def _upload_tmpfiles(filename: str, data: bytes) -> str:
     r.raise_for_status()
     j = r.json()
     url = j.get("data", {}).get("url", "")
+    # fuerza link directo y https
     url = url.replace("tmpfiles.org/", "tmpfiles.org/dl/")
     return _ensure_https(url)
 
@@ -103,6 +96,7 @@ def _img_to_bytes(image, fmt="png", quality=95) -> bytes:
     if torch is not None and isinstance(image, torch.Tensor):
         t = image
         if t.ndim == 4:
+            # B,C,H,W o B,H,W,C -> HWC
             if t.shape[1] in (1, 3) and t.shape[-1] not in (1, 3):
                 t = t.permute(0, 2, 3, 1)
             t = t[0]
@@ -135,9 +129,9 @@ def _to_numpy(x):
 def _samples_to_wav(samples, sr: int) -> bytes:
     arr = _to_numpy(samples)
     if arr.ndim == 1:
-        arr = arr[:, None]
+        arr = arr[:, None]          # [T] -> [T,1]
     if arr.shape[0] <= 8 and arr.shape[0] < arr.shape[1]:
-        arr = arr.T
+        arr = arr.T                 # [C,T] -> [T,C]
     arr = arr.clip(-1.0, 1.0)
     if arr.dtype.kind == "f":
         arr = (arr * 32767.0).round().astype("int16")
@@ -150,99 +144,6 @@ def _samples_to_wav(samples, sr: int) -> bytes:
         wf.setframerate(int(sr or 44100))
         wf.writeframes(arr.tobytes(order="C"))
     return bio.getvalue()
-
-def _decode_bytes_string(s: str) -> bytes:
-    """
-    Acepta:
-      - Literal de bytes estilo Python:  b'ID3\\x04...'
-      - data URI: data:audio/mpeg;base64,....
-      - Base64 “puro”
-      - Hex (con o sin 0x)
-      - Texto crudo (latin-1)
-    """
-    if not isinstance(s, str):
-        raise RuntimeError("Expected STRING with byte content")
-    s = s.strip()
-
-    # 1) bytes literal estilo Python
-    if (s.startswith("b'") and s.endswith("'")) or (s.startswith('b"') and s.endswith('"')):
-        try:
-            val = ast.literal_eval(s)  # -> bytes
-            if isinstance(val, (bytes, bytearray)):
-                return bytes(val)
-        except Exception:
-            pass
-
-    # 2) data URI
-    if _is_data_uri(s):
-        m = re.match(r"data:([^;]+);base64,(.*)$", s, re.IGNORECASE | re.DOTALL)
-        if m:
-            b64 = m.group(2)
-            return base64.b64decode(b64)
-        raise RuntimeError("Unsupported data URI for bytes string")
-
-    # 3) Base64 puro
-    try:
-        return base64.b64decode(s, validate=True)
-    except Exception:
-        pass
-
-    # 4) Hex
-    hex_s = s[2:] if s.lower().startswith("0x") else s
-    try:
-        hex_s_clean = re.sub(r"\s+", "", hex_s)
-        return bytes.fromhex(hex_s_clean)
-    except Exception:
-        pass
-
-    # 5) Fallback texto→bytes
-    return s.encode("latin-1", errors="ignore")
-
-
-# ============ helpers para dict VIDEO (URLs/paths) ============
-
-_URL_KEYS = ("video_url", "url", "href", "link", "src")
-_PATH_KEYS = ("path", "video_path", "local_path", "tmp_path", "filename", "file")
-
-def _dict_first_url(obj):
-    if isinstance(obj, dict):
-        for k in _URL_KEYS:
-            v = obj.get(k)
-            if isinstance(v, str) and _is_url(v):
-                return v
-        v = obj.get("video")
-        if isinstance(v, (dict, str)):
-            return _dict_first_url(v)
-        for v in obj.values():
-            if isinstance(v, str) and _is_url(v):
-                return v
-            if isinstance(v, dict):
-                out = _dict_first_url(v)
-                if out:
-                    return out
-    elif isinstance(obj, str) and _is_url(obj):
-        return obj
-    return None
-
-def _dict_first_path(obj):
-    if isinstance(obj, dict):
-        for k in _PATH_KEYS:
-            v = obj.get(k)
-            if isinstance(v, str) and os.path.isfile(v):
-                return v
-        v = obj.get("video")
-        if isinstance(v, (dict, str)):
-            return _dict_first_path(v)
-        for v in obj.values():
-            if isinstance(v, str) and os.path.isfile(v):
-                return v
-            if isinstance(v, dict):
-                out = _dict_first_path(v)
-                if out:
-                    return out
-    elif isinstance(obj, str) and os.path.isfile(obj):
-        return obj
-    return None
 
 
 # ============ nodos ============
@@ -434,148 +335,13 @@ class PathToURL_0x0:
         raise RuntimeError("Invalid path for PathToURL_0x0")
 
 
-class VideoToURL_0x0:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "video": ("VIDEO",),   # acepta salida de Kling u otros nodos
-                "filename_hint": ("STRING", {"default": "video.mp4"}),
-                "force_upload": ("BOOLEAN", {"default": False}),
-                "uploader": (["auto", "0x0", "transfer.sh", "tmpfiles"], {"default": "auto"}),
-            }
-        }
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("url",)
-    FUNCTION = "run"
-    CATEGORY = "I/O → URL"
-
-    def _handle_url(self, url: str, filename_hint: str, uploader: str, force_upload: bool):
-        if not force_upload:
-            return (_ensure_https(url),)
-        data = _download_bytes(url)
-        ext = "mp4"
-        m = re.search(r"\.([A-Za-z0-9]+)(?:\?|$)", url)
-        if m:
-            ext = m.group(1).lower()
-        fn = (filename_hint.strip() or f"video.{ext}")
-        if not fn.lower().endswith(f".{ext}"):
-            fn = f"{fn}.{ext}"
-        return (_upload_bytes(fn, data, uploader=uploader),)
-
-    def run(self, video, filename_hint="video.mp4", force_upload=False, uploader="auto"):
-        # 1) string (url / data uri / path)
-        if isinstance(video, str):
-            s = video.strip()
-            if _is_url(s):
-                return self._handle_url(s, filename_hint, uploader, force_upload)
-            if _is_data_uri(s) and s.lower().startswith("data:video"):
-                m = re.match(r"data:(video/[A-Za-z0-9.+-]+);base64,(.*)$", s, re.IGNORECASE | re.DOTALL)
-                if not m:
-                    raise RuntimeError("Unsupported video data URI")
-                mime, b64 = m.groups()
-                data = base64.b64decode(b64)
-                ext = mime.split("/")[-1] or "mp4"
-                fn = filename_hint.strip() or f"video.{ext}"
-                if not fn.lower().endswith(f".{ext}"):
-                    fn = f"{fn}.{ext}"
-                return (_upload_bytes(fn, data, uploader=uploader),)
-            if os.path.isfile(s):
-                with open(s, "rb") as f:
-                    data = f.read()
-                fn = filename_hint.strip() or os.path.basename(s)
-                return (_upload_bytes(fn, data, uploader=uploader),)
-            raise RuntimeError("Invalid string input for VideoToURL_0x0")
-
-        # 2) dict (Kling suele devolver URL pública o anidada)
-        if hasattr(video, "get"):
-            d = video
-            u = _dict_first_url(d)
-            if u:
-                return self._handle_url(u, filename_hint, uploader, force_upload)
-            p = _dict_first_path(d)
-            if p:
-                with open(p, "rb") as f:
-                    data = f.read()
-                fn = filename_hint.strip() or os.path.basename(p)
-                return (_upload_bytes(fn, data, uploader=uploader),)
-
-        # 3) objeto con atributo video_path
-        if hasattr(video, "video_path") and isinstance(video.video_path, str) and os.path.isfile(video.video_path):
-            with open(video.video_path, "rb") as f:
-                data = f.read()
-            fn = filename_hint.strip() or os.path.basename(video.video_path)
-            return (_upload_bytes(fn, data, uploader=uploader),)
-
-        # 4) lista/tupla [url|path, ...]
-        if isinstance(video, (list, tuple)) and len(video) > 0 and isinstance(video[0], str):
-            s = video[0].strip()
-            if _is_url(s):
-                return self._handle_url(s, filename_hint, uploader, force_upload)
-            if os.path.isfile(s):
-                with open(s, "rb") as f:
-                    data = f.read()
-                fn = filename_hint.strip() or os.path.basename(s)
-                return (_upload_bytes(fn, data, uploader=uploader),)
-
-        raise RuntimeError("VideoToURL_0x0: unsupported VIDEO payload")
-
-
-# ======== NUEVO NODO: ByteString (MP3) → URL ========
-
-class ByteStringMP3ToURL_0x0:
-    """
-    Recibe bytes en formato STRING (por ejemplo:  b'ID3\\x04...') y sube el MP3,
-    devolviendo una URL pública (0x0.st / transfer.sh / tmpfiles).
-    """
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "bytes_string": ("STRING", {"multiline": True, "default": ""}),
-                "filename": ("STRING", {"default": "audio.mp3"}),
-                "uploader": (["auto", "0x0", "transfer.sh", "tmpfiles"], {"default": "auto"}),
-                "force_upload": ("BOOLEAN", {"default": True}),
-            }
-        }
-
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("url",)
-    FUNCTION = "run"
-    CATEGORY = "I/O → URL"
-
-    def run(self, bytes_string, filename="audio.mp3", uploader="auto", force_upload=True):
-        if not isinstance(bytes_string, str) or not bytes_string.strip():
-            raise RuntimeError("ByteStringMP3ToURL_0x0: expected non-empty STRING")
-
-        s = bytes_string.strip()
-
-        if not force_upload and _is_url(s):
-            return (_ensure_https(s),)
-
-        data = _decode_bytes_string(s)
-
-        fn = (filename or "audio.mp3").strip()
-        if not fn.lower().endswith(".mp3"):
-            fn = f"{fn}.mp3"
-
-        url = _upload_bytes(fn, data, uploader=uploader)
-        return (_ensure_https(url),)
-
-
-# ============ registros ============
-
 NODE_CLASS_MAPPINGS = {
     "ImageToURL_0x0": ImageToURL_0x0,
     "AudioToURL_0x0": AudioToURL_0x0,
     "PathToURL_0x0": PathToURL_0x0,
-    "VideoToURL_0x0": VideoToURL_0x0,
-    "ByteStringMP3ToURL_0x0": ByteStringMP3ToURL_0x0,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "ImageToURL_0x0": "Image → URL (0x0.st)",
     "AudioToURL_0x0": "Audio → URL (0x0.st)",
     "PathToURL_0x0": "Path → URL (0x0.st)",
-    "VideoToURL_0x0": "Video → URL (0x0.st)",
-    "ByteStringMP3ToURL_0x0": "ByteString (MP3) → URL (0x0.st)",
 }
